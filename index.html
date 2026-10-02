@@ -1,0 +1,795 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quest for the Crown</title>
+<style>
+  html,body{margin:0;background:#000;color:#ccc;font-family:"Courier New",monospace}
+  #wrap{max-width:960px;margin:0 auto}
+  #bar{display:flex;justify-content:space-between;background:#fff;color:#000;padding:3px 10px;font-weight:bold;font-size:15px}
+  canvas{display:block;width:100%;aspect-ratio:320/180;image-rendering:pixelated;background:#000;cursor:crosshair}
+  #log{height:150px;overflow-y:auto;border-top:3px double #aaa;padding:6px 10px;font-size:16px;line-height:1.35}
+  #log p{margin:0 0 5px}
+  .sys{color:#5ff}.bad{color:#f55}.good{color:#5f5}.you{color:#777}
+  #form{display:flex;border-top:1px solid #444;margin:0}
+  #form span{padding:7px 0 7px 10px;color:#ff5}
+  #in{flex:1;background:#000;color:#ff5;border:0;outline:0;font:inherit;font-size:16px;padding:7px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar"><span id="score">Score: 0 of 100</span><span>QUEST FOR THE CROWN</span></div>
+  <canvas id="c" width="320" height="180"></canvas>
+  <div id="log"></div>
+  <form id="form" autocomplete="off"><span>&gt;</span><input id="in" autofocus spellcheck="false" autocapitalize="off" placeholder="type a command, e.g. look, take flowers, talk king"></form>
+</div>
+
+<script>
+(() => {
+'use strict';
+const W = 320, H = 180;
+const cv = document.getElementById('c');
+const main = cv.getContext('2d');
+let ctx = main;
+const logEl = document.getElementById('log');
+const inEl = document.getElementById('in');
+const scoreEl = document.getElementById('score');
+
+/* ---------- drawing helpers (EGA palette) ---------- */
+const PAL = ['#000','#00a','#0a0','#0aa','#a00','#a0a','#a50','#aaa','#555','#55f','#5f5','#5ff','#f55','#f5f','#ff5','#fff'];
+const col = c => typeof c === 'number' ? PAL[c] : c;
+function R(x, y, w, h, c) { ctx.fillStyle = col(c); ctx.fillRect(Math.round(x), Math.round(y), w, h); }
+function disc(cx, cy, r, c) {
+  for (let dy = -r; dy <= r; dy++) {
+    const w = Math.floor(Math.sqrt(r * r - dy * dy + 0.5));
+    R(cx - w, cy + dy, 2 * w + 1, 1, c);
+  }
+}
+function cone(cx, top, w, h, c) {
+  for (let i = 0; i < h; i++) { const ww = Math.max(1, Math.round(w * i / h)); R(cx - (ww >> 1), top + i, ww, 1, c); }
+}
+function rnd(seed) { let s = seed; return () => (s = (s * 16807) % 2147483647) / 2147483647; }
+function txt(s, x, y, c, size = 8) {
+  ctx.font = `bold ${size}px monospace`; ctx.textAlign = 'center'; ctx.fillStyle = col(c);
+  ctx.fillText(s, x, y);
+}
+function sky(h) {
+  R(0, 0, W, h, 11);
+  R(0, 0, W, 10, '#4cf');
+  [[40, 18, 1], [130, 30, 1], [250, 14, 1], [200, 40, 0]].forEach(([x, y]) => {
+    disc(x, y, 5, 15); disc(x + 7, y + 1, 4, 15); disc(x - 7, y + 1, 4, 15);
+  });
+}
+function grass(top, seed = 7) {
+  R(0, top, W, H - top, 2);
+  const r = rnd(seed);
+  for (let i = 0; i < 260; i++) {
+    const x = r() * W | 0, y = top + (r() * (H - top)) | 0;
+    R(x, y, 1, 2, 10); R(x + 3, y + 1, 2, 1, '#080');
+  }
+}
+function tree(x, y) {
+  R(x - 3, y - 22, 6, 22, 6); R(x - 3, y - 22, 2, 22, '#830');
+  disc(x, y - 36, 14, 2); disc(x - 10, y - 27, 9, 2); disc(x + 10, y - 27, 9, 2);
+  disc(x - 4, y - 40, 6, 10); disc(x + 8, y - 32, 4, 10);
+  disc(x - 12, y - 26, 3, '#080');
+}
+function tuft(x, y, c) { R(x, y, 1, 4, 2); R(x - 1, y - 2, 3, 3, c); }
+
+/* ---------- state ---------- */
+const keys = {};
+let mode = 'title';           // title | play | dead | win
+let room = 'castle';
+let p = { x: 60, y: 130, dir: 'r', moving: false, t: 0 };
+let inv = new Set();
+let flags = {};
+let score = 0;
+let snap = null;
+let target = null;
+let bumpT = 0;
+let T = 0;
+
+const ITEMS = {
+  flowers: { names: ['flowers', 'flower', 'bouquet', 'posy'], title: 'a bunch of flowers', desc: () => 'A bunch of sweet-smelling wildflowers.' },
+  bucket:  { names: ['bucket', 'pail'], title: 'a bucket', desc: () => flags.water ? 'A wooden bucket, full of cold water.' : 'A sturdy wooden bucket. It is empty.' },
+  coin:    { names: ['coin', 'gold coin'], title: 'a gold coin', desc: () => 'A shiny gold coin. Trolls are said to love these.' },
+  lantern: { names: ['lantern', 'lamp'], title: 'an old lantern', desc: () => flags.lit ? 'The old lantern burns with a warm glow.' : 'An old brass lantern. It is not lit.' },
+  crown:   { names: ['crown'], title: 'the Crown of Eldoria', desc: () => 'The Crown of Eldoria! Heavy with jewels. The King will be overjoyed.' },
+};
+
+/* ---------- output ---------- */
+function say(s, cls = '') {
+  const el = document.createElement('p');
+  if (cls) el.className = cls;
+  el.textContent = s;
+  logEl.appendChild(el);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function pts(n) { score += n; scoreEl.textContent = `Score: ${score} of 100`; }
+function give_item(id) { inv.add(id); }
+
+/* ---------- characters / sprites ---------- */
+function drawPlayer() {
+  const x = Math.round(p.x), y = Math.round(p.y);
+  const f = p.moving ? (Math.floor(p.t * 8) % 2) : 0;
+  ctx.globalAlpha = .3; R(x - 6, y - 1, 12, 3, 0); ctx.globalAlpha = 1;
+  R(x - 3, y - 9, 3, 9 - f, '#33a'); R(x + 1, y - 9, 3, 8 + f - 0, '#33a');
+  R(x - 3, y - 2 - f, 3, 2, 6); R(x + 1, y - 2 + f - 1 + 1, 3, 2, 6);
+  R(x - 4, y - 17, 9, 9, 9); R(x - 4, y - 12, 9, 1, 6); R(x - 1, y - 17, 3, 2, 15);
+  const sw = p.moving ? (f ? 1 : -1) : 0;
+  R(x - 6, y - 16 + sw, 2, 7, 9); R(x + 4, y - 16 - sw, 2, 7, 9);
+  R(x - 6, y - 10 + sw, 2, 2, '#fa8'); R(x + 4, y - 10 - sw, 2, 2, '#fa8');
+  R(x - 3, y - 23, 7, 6, '#fa8');
+  if (p.dir !== 'u') {
+    const ex = p.dir === 'l' ? -2 : p.dir === 'r' ? 1 : 0;
+    R(x - 2 + ex, y - 21, 1, 2, 0); R(x + 1 + ex, y - 21, 1, 2, 0);
+  } else { R(x - 3, y - 23, 7, 3, '#a50'); }
+  R(x - 4, y - 25, 9, 3, 4); R(x + 3, y - 29, 2, 5, 15); R(x + 2, y - 29, 1, 2, 15);
+}
+function drawKing(x, y) {
+  R(x - 6, y - 15, 12, 15, 4); R(x - 6, y - 2, 12, 2, '#800');
+  R(x - 6, y - 16, 12, 3, 15); R(x - 7, y - 14, 2, 8, 4); R(x + 5, y - 14, 2, 8, 4);
+  R(x - 3, y - 23, 7, 7, '#fa8'); R(x - 3, y - 18, 7, 4, 15);
+  R(x - 2, y - 21, 1, 1, 0); R(x + 1, y - 21, 1, 1, 0);
+  R(x - 4, y - 27, 9, 4, 14); R(x - 4, y - 29, 2, 2, 14); R(x, y - 29, 2, 2, 14); R(x + 3, y - 29, 2, 2, 14);
+  R(x, y - 26, 1, 1, 12);
+}
+function drawGuard(x, y) {
+  R(x - 4, y - 16, 8, 16, 8); R(x - 4, y - 8, 8, 1, 7);
+  R(x - 3, y - 22, 7, 6, 7); R(x - 3, y - 21, 7, 2, 0);
+  R(x + 6, y - 40, 1, 40, 6); cone(x + 6, y - 46, 5, 7, 7);
+}
+function drawTroll(x, y) {
+  R(x - 11, y - 30, 22, 30, '#476'); R(x - 11, y - 16, 22, 3, '#342');
+  disc(x, y - 36, 9, '#587');
+  R(x - 5, y - 40, 3, 3, 14); R(x + 2, y - 40, 3, 3, 14); R(x - 4, y - 39, 1, 1, 0); R(x + 3, y - 39, 1, 1, 0);
+  R(x - 4, y - 31, 9, 3, 15 - 15); R(x - 3, y - 32, 1, 2, 15); R(x + 2, y - 32, 1, 2, 15);
+  R(x + 12, y - 40, 5, 34, 6); disc(x + 14, y - 42, 5, 6);
+  R(x - 15, y - 24, 5, 10, '#587'); R(x - 8, y, 6, 3, '#342'); R(x + 3, y, 6, 3, '#342');
+}
+function drawWoman(x, y) {
+  R(x - 8, y - 6, 16, 6, 6); R(x - 7, y - 4, 2, 4, 6); R(x + 5, y - 4, 2, 4, 6);
+  R(x - 6, y - 20, 12, 14, 5); R(x - 6, y - 12, 12, 2, 13);
+  R(x - 3, y - 27, 7, 7, '#fa8'); R(x - 4, y - 29, 9, 4, 7); R(x - 4, y - 27, 2, 7, 7); R(x + 3, y - 27, 2, 7, 7);
+  R(x - 2, y - 25, 1, 1, 0); R(x + 1, y - 25, 1, 1, 0);
+  R(x - 9, y - 18, 3, 9, 5); R(x + 6, y - 18, 3, 9, 5);
+}
+function drawDragon() {
+  const t = T, bob = Math.round(Math.sin(t * 2) * 1);
+  R(238, 114 + bob, 36, 6, '#080'); R(268, 111 + bob, 10, 5, '#080'); cone(279, 108 + bob, 6, 8, '#080');
+  disc(222, 102 + bob, 21, 2); disc(218, 110 + bob, 12, '#7c4');
+  for (let i = 0; i < 6; i++) cone(210 + i * 7, 78 + bob + (i % 2), 6, 7, 4);
+  R(208, 116, 8, 8, 2); R(232, 116, 8, 8, 2); R(207, 123, 10, 2, 15); R(231, 123, 10, 2, 15);
+  disc(196, 92 + bob, 11, 2); R(181, 91 + bob, 14, 8, 2); R(181, 97 + bob, 14, 1, '#080');
+  R(184, 92 + bob, 2, 2, 0); R(194, 87 + bob, 4, 4, 14); R(195, 88 + bob, 1, 3, 0);
+  R(183, 98 + bob, 1, 3, 15); R(188, 98 + bob, 1, 3, 15);
+  cone(196, 76 + bob, 6, 8, 15);
+  if (p.x > 120) {
+    for (let i = 0; i < 22; i++) {
+      const fl = Math.sin(t * 20 + i) * 2;
+      R(180 - i * 4, 94 + bob + fl - i * .15, 5, 4 + (i >> 2), i % 2 ? 12 : 14);
+    }
+  }
+}
+function drawBucket(x, y) { R(x, y, 7, 6, 6); R(x, y + 1, 7, 1, '#fa5'); R(x + 2, y - 2, 3, 1, 8); R(x + 2, y - 2, 1, 2, 8); R(x + 4, y - 2, 1, 2, 8); }
+function drawFlowers(x, y) {
+  [[-10, 2, 12], [-4, -3, 14], [3, 1, 13], [9, -2, 12], [-1, 4, 15], [6, 5, 14]].forEach(([dx, dy, c]) => {
+    R(x + dx, y + dy, 1, 6, 2); R(x + dx - 1, y + dy - 2, 3, 3, c); R(x + dx, y + dy - 1, 1, 1, 14);
+  });
+}
+function drawCrownSprite(x, y) {
+  R(x - 6, y - 4, 12, 5, 14); R(x - 6, y - 8, 3, 4, 14); R(x - 1, y - 9, 3, 5, 14); R(x + 3, y - 8, 3, 4, 14);
+  R(x - 5, y - 2, 2, 2, 12); R(x, y - 2, 2, 2, 9); R(x + 4, y - 2, 2, 2, 10);
+}
+
+/* ---------- rooms ---------- */
+const ROOMS = {};
+
+ROOMS.castle = {
+  horizon: 84, exits: { e: 'meadow' },
+  desc: () => 'You stand before the great castle of Eldoria. King Edward paces anxiously on the cobblestones. A path leads east.',
+  bg() {
+    sky(84);
+    R(40, 22, 240, 62, 7);
+    for (let y = 28; y < 84; y += 6) { R(40, y, 240, 1, 8); for (let x = 40 + ((y / 6 | 0) % 2) * 8; x < 280; x += 16) R(x, y, 1, 6, 8); }
+    for (let x = 40; x < 280; x += 14) R(x, 16, 9, 7, 7);
+    [24, 262].forEach(x => {
+      R(x, 12, 34, 72, 7);
+      for (let y = 18; y < 84; y += 6) R(x, y, 34, 1, 8);
+      R(x + 6, 36, 4, 12, 0); R(x + 22, 36, 4, 12, 0);
+      R(x - 2, 8, 38, 5, 7); for (let i = 0; i < 6; i++) R(x - 2 + i * 7, 3, 5, 5, 7);
+      cone(x + 17, -14, 46, 22, 4);
+    });
+    R(140, 46, 40, 38, 0); disc(160, 46, 20, 0);
+    for (let x = 142; x < 180; x += 6) R(x, 28, 1, 56, 8);
+    for (let y = 36; y < 84; y += 8) R(140, y, 40, 1, 8);
+    R(160, 6, 1, 18, 8); R(161, 6, 13, 8, 12); R(161, 9, 13, 2, 14);
+    grass(84, 3);
+    R(132, 84, 56, H - 84, '#d9b36a');
+    const r = rnd(11);
+    for (let i = 0; i < 120; i++) { const x = 132 + r() * 56 | 0, y = 84 + r() * (H - 84) | 0; R(x, y, 3, 1, '#b8924a'); }
+    for (let i = 0; i < 14; i++) tuft(r() * W | 0, 90 + r() * 80 | 0, 12 + (i % 3));
+  },
+  sprites: () => [
+    { y: 92, f: () => drawGuard(126, 92) },
+    { y: 92, f: () => drawGuard(194, 92) },
+    { y: 128, f: () => drawKing(225, 128) },
+  ],
+  obst: [],
+  objs: [
+    { names: ['king', 'edward', 'majesty'], x: 225, y: 128, r: 55,
+      look: () => say(flags.crownTaken ? 'King Edward looks at you expectantly, eyes fixed on the crown in your hands.' : 'King Edward, ruler of Eldoria. His head looks strangely bare without a crown.'),
+      talk() {
+        if (flags.crownTaken) return say('"Is that... the Crown?! Give it to me!"', 'good');
+        if (!flags.quest) { flags.quest = true; return say('"Sir Rowan! Thank the stars! The Crown of Eldoria was stolen by the dragon that lives in the cave beyond the river. Bring it back and you shall inherit my throne!"', 'good'); }
+        say('"The dragon\'s cave lies east, past the river. Hurry, brave knight! You may find help in the meadow and beyond."');
+      },
+      give(it) {
+        if (it === 'crown') { pts(20); win(); return; }
+        say('"Thank you, but what I need is my crown!"');
+      } },
+    { names: ['guard', 'guards', 'soldier'], x: 126, y: 92, r: 60,
+      look: () => say('Two stern guards stand watch at the gate. They don\'t look like they want to chat.'),
+      talk: () => say('"Move along. Talk to the King."') },
+    { names: ['castle', 'gate', 'door', 'portcullis'], x: 160, y: 84, r: 90,
+      look: () => say('The castle of Eldoria is built of grey stone. Its great gate is firmly shut.'),
+      open: () => say('The guards cross their spears. "The gate stays shut until the crown is found."') },
+  ],
+};
+
+ROOMS.meadow = {
+  horizon: 60, exits: { w: 'castle', e: 'river', n: 'forest', s: 'cottage' },
+  desc: () => 'A sunny meadow dotted with flowers. An old stone well stands to the east. Paths lead west to the castle, east to a river, north into a forest and south to a cottage.',
+  bg() {
+    sky(60);
+    disc(40, 70, 36, '#3a3'); disc(130, 74, 44, '#2b2'); disc(250, 72, 40, '#3a3'); disc(320, 70, 30, '#2b2');
+    grass(60, 21);
+    const r = rnd(5);
+    for (let i = 0; i < 40; i++) { const x = r() * W | 0, y = 64 + r() * 110 | 0; R(x, y, 2, 2, [12, 14, 13, 15][i % 4]); R(x, y + 2, 1, 2, 2); }
+  },
+  sprites: () => {
+    const l = [
+      { y: 90, f: () => tree(40, 90) },
+      { y: 104, f: () => tree(292, 104) },
+      { y: 114, f: () => {
+        R(228, 98, 24, 16, 7); for (let y = 98; y < 114; y += 4) R(228, y, 24, 1, 8);
+        R(231, 98, 18, 4, '#136'); R(229, 78, 3, 22, 6); R(248, 78, 3, 22, 6); R(226, 74, 28, 5, 4);
+        if (!flags.bucketTaken) { R(239, 79, 1, 7, 6); drawBucket(237, 85); }
+      } },
+      { y: 400, f: () => {
+        const bx = 150 + Math.sin(T * 1.5) * 40, by = 100 + Math.cos(T * 2.3) * 12, w = Math.sin(T * 25) > 0 ? 2 : 1;
+        R(bx - w, by, w, 2, 14); R(bx + 1, by, w, 2, 14); R(bx, by, 1, 2, 0);
+      } },
+    ];
+    if (!flags.flowersTaken) l.push({ y: 135, f: () => drawFlowers(90, 135) });
+    return l;
+  },
+  obst: [{ r: [226, 100, 254, 114] }, { r: [34, 86, 46, 91] }, { r: [286, 100, 298, 105] }],
+  objs: [
+    { names: ['flowers', 'flower', 'bouquet', 'patch'], x: 90, y: 135, r: 40, vis: () => !flags.flowersTaken,
+      look: () => say('Pretty wildflowers: red, yellow and pink. They smell wonderful.'),
+      take() { flags.flowersTaken = true; give_item('flowers'); pts(5); say('You pick a fragrant bunch of wildflowers.', 'good'); } },
+    { names: ['well'], x: 240, y: 112, r: 40,
+      look() {
+        if (!near(this)) return say('An old stone well. You\'d have to get closer to look inside.');
+        flags.wellSeen = true;
+        say(`An old stone well.${flags.bucketTaken ? '' : ' A bucket hangs from the rope.'} Something shiny glints at the bottom${flags.coinTaken ? ', no wait, you already took the coin.' : '.'}`);
+      } },
+    { names: ['bucket', 'pail', 'rope'], x: 240, y: 112, r: 40, vis: () => !flags.bucketTaken,
+      look: () => say('A wooden bucket hanging from the well rope.'),
+      take() { flags.bucketTaken = true; give_item('bucket'); pts(5); say('You unhook the bucket from the rope.', 'good'); } },
+    { names: ['coin', 'gold coin', 'glint', 'shiny'], x: 240, y: 112, r: 40, vis: () => flags.wellSeen && !flags.coinTaken,
+      look: () => say('A gold coin lies at the bottom of the well. Maybe you can reach it.'),
+      take() { flags.coinTaken = true; give_item('coin'); pts(10); say('You fish the gold coin out of the well with the rope. Lucky!', 'good'); } },
+    { names: ['butterfly'], x: 150, y: 100, r: 400, look: () => say('A little yellow butterfly flutters past.') },
+  ],
+};
+
+ROOMS.river = {
+  horizon: 70, exits: { w: 'meadow', e: 'cave' },
+  desc: () => 'A swift river cuts across the land. A wooden bridge crosses it.' + (flags.trollPaid ? '' : ' A hulking troll blocks the bridge!') + ' The cave of the dragon lies to the east.',
+  bg() {
+    sky(70); grass(70, 9);
+    R(124, 70, 72, H - 70, '#a50'); R(128, 70, 64, H - 70, 9);
+    const r = rnd(2);
+    for (let i = 0; i < 60; i++) { R(130 + r() * 58 | 0, 72 + r() * 106 | 0, 5, 1, 1); }
+    R(122, 106, 76, 40, 6);
+    for (let x = 122; x < 198; x += 6) R(x, 106, 1, 40, '#430');
+    R(122, 106, 76, 2, '#fa5'); R(122, 143, 76, 3, '#430');
+    for (let x = 124; x < 198; x += 18) { R(x, 100, 3, 8, '#830'); R(x, 144, 3, 8, '#830'); }
+    R(122, 100, 76, 2, '#fa5'); R(122, 150, 76, 2, '#fa5');
+  },
+  sprites: () => {
+    const l = [
+      { y: 96, f: () => tree(40, 96) }, { y: 100, f: () => tree(270, 100) },
+      { y: 170, f: () => tree(280, 174) },
+    ];
+    if (!flags.trollPaid) l.push({ y: 130, f: () => drawTroll(162, 130) });
+    else l.push({ y: 150, f: () => { disc(160, 148, 9, '#587'); R(155, 144, 3, 3, 14); R(162, 144, 3, 3, 14); R(156, 145, 1, 1, 0); R(163, 145, 1, 1, 0); } });
+    return l;
+  },
+  after() { for (let i = 0; i < 14; i++) { const x = 132 + (i * 37 + T * 25) % 56, y = 74 + (i * 53) % 100; if (!(y > 104 && y < 148)) R(x, y, 4, 1, 15); } },
+  obst: [
+    { r: [126, 70, 194, 106] }, { r: [126, 146, 194, 178] },
+    { r: [140, 100, 184, 150], on: () => !flags.trollPaid, bump: 'The troll bars your way. "Nobody crosses my bridge without a gift! Something shiny, perhaps?"' },
+    { r: [34, 92, 46, 97] }, { r: [264, 96, 276, 101] }, { r: [274, 170, 286, 175] },
+  ],
+  objs: [
+    { names: ['troll'], x: 162, y: 130, r: 70,
+      look: () => say(flags.trollPaid ? 'The troll has retreated beneath the bridge. His eyes glint in the shadows.' : 'A huge, warty troll. He eyes you greedily and sniffs the air.'),
+      talk: () => say(flags.trollPaid ? '"Hurrumph. Go on, then. Just don\'t scratch the planks."' : '"Gimme something SHINY and I\'ll let you cross!"'),
+      give(it) {
+        if (flags.trollPaid) return say('"I already got my toll, thanks."');
+        if (it === 'coin') { inv.delete('coin'); flags.trollPaid = true; pts(15); return say('The troll bites the coin, grins a gappy grin and slinks beneath the bridge. "Pass, little knight!"', 'good'); }
+        if (it === 'flowers') return say('"Bah! Weeds! I want something SHINY!"');
+        say('The troll sneers. "Not shiny enough."');
+      } },
+    { names: ['river', 'water', 'stream'], x: 160, y: 125, r: 9999,
+      look: () => say('Clear, cold water rushes past. It looks perfect for filling a bucket.') },
+    { names: ['bridge'], x: 160, y: 125, r: 9999, look: () => say('A sturdy wooden bridge. It\'s the only way across.') },
+  ],
+};
+
+ROOMS.cave = {
+  horizon: 60, exits: { w: 'river' },
+  desc: () => flags.lit
+    ? (flags.dragonGone ? 'The dragon\'s lair. A glittering hoard of treasure lies at the back of the cave.' : 'You are in the dragon\'s lair! A huge green dragon snarls at you from atop a mountain of gold. Don\'t get too close!')
+    : 'It\'s pitch black in here! You can\'t see a thing. You have a bad feeling about taking another step without light...',
+  bg() {
+    R(0, 0, W, H, '#222');
+    const r = rnd(4);
+    for (let i = 0; i < 300; i++) { R(r() * W | 0, r() * H | 0, 2 + r() * 4 | 0, 1 + r() * 2 | 0, r() > .5 ? 8 : '#333'); }
+    R(0, 60, W, H - 60, '#3a3a3a');
+    for (let i = 0; i < 200; i++) R(r() * W | 0, 60 + r() * 120 | 0, 3, 1, 8);
+    for (let x = 0; x < W; x += 20) cone(x + 8 + (x % 3) * 3, 0, 8 + (x % 7), 14 + (x % 5) * 5, '#555');
+    for (let i = 0; i < 18; i++) { disc(250 + r() * 38 | 0, 124 + r() * 6 | 0, 3 + r() * 4 | 0, r() > .5 ? 14 : 6); }
+    for (let i = 0; i < 10; i++) R(246 + r() * 42 | 0, 118 + r() * 8 | 0, 2, 2, 15);
+    R(2, 52, 4, 10, '#a50'); R(0, 50, 8, 4, '#333');
+  },
+  sprites: () => {
+    const l = [];
+    if (!flags.dragonGone) l.push({ y: 124, f: drawDragon });
+    if (!flags.crownTaken) l.push({ y: 126, f: () => drawCrownSprite(268, 120) });
+    return l;
+  },
+  after() {
+    if (!flags.lit) { ctx.globalAlpha = .97; R(0, 0, W, H, 0); ctx.globalAlpha = 1; }
+    else {
+      const g = ctx.createRadialGradient(p.x, p.y - 12, 30, p.x, p.y - 12, 190);
+      g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,.55)');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    }
+  },
+  obst: [],
+  objs: [
+    { names: ['dragon', 'beast', 'monster'], x: 215, y: 115, r: 130, vis: () => flags.lit && !flags.dragonGone,
+      look: () => say('A colossal green dragon, smoke curling from its nostrils. It guards a hoard of gold. Surely something this fiery fears something very different...'),
+      talk: () => say('The dragon roars, singeing your eyebrows. It\'s not much of a talker.'),
+      give: () => say('The dragon is unimpressed. It just wants to eat you.') },
+    { names: ['crown'], x: 268, y: 122, r: 45, vis: () => flags.lit && !flags.crownTaken,
+      look: () => say('The Crown of Eldoria, glittering with rubies and emeralds, sits on top of the hoard.'),
+      take() {
+        if (!flags.dragonGone) return say('You can\'t reach it with the dragon in the way!');
+        flags.crownTaken = true; give_item('crown'); pts(10);
+        say('You lift the Crown of Eldoria from the hoard! Now to take it back to the King.', 'good');
+      } },
+    { names: ['hoard', 'treasure', 'gold', 'pile'], x: 268, y: 122, r: 45, vis: () => flags.lit,
+      look: () => say('A heap of gold and gems. Nice, but you\'re only here for the crown.'),
+      take: () => say('Greed is not the knightly way. You only want the crown.') },
+  ],
+};
+
+ROOMS.forest = {
+  horizon: 44, exits: { s: 'meadow' },
+  desc: () => 'Tall trees crowd around you. An owl peers down from a branch. A ring of red mushrooms grows nearby. A path leads south.',
+  trees: [[24, 70], [76, 104], [132, 76], [186, 128], [240, 82], [292, 108], [38, 158], [118, 172], [268, 168]],
+  bg() {
+    R(0, 0, W, H, '#063'); grass(44, 33);
+    const r = rnd(8);
+    for (let i = 0; i < 14; i++) disc(r() * W | 0, 20 + r() * 20 | 0, 12 + r() * 8 | 0, i % 2 ? '#063' : '#052');
+    R(0, 44, W, 3, '#052');
+  },
+  sprites() {
+    const l = this.trees.map(([x, y]) => ({ y, f: () => tree(x, y) }));
+    l.push({ y: 400, f: () => {
+      const b = Math.sin(T * .8) > .9;
+      disc(132, 46, 6, '#a86'); R(128, 38, 2, 3, '#a86'); R(134, 38, 2, 3, '#a86');
+      R(128, 44, 3, 3, 14); R(134, 44, 3, 3, 14);
+      if (!b) { R(129, 45, 1, 1, 0); R(135, 45, 1, 1, 0); } else { R(128, 45, 3, 1, '#a86'); R(134, 45, 3, 1, '#a86'); }
+      R(131, 48, 3, 2, 6);
+    } });
+    l.push({ y: 148, f: () => { [[-12, 0], [-4, 3], [5, -1], [12, 3], [0, -4]].forEach(([dx, dy]) => { R(215 + dx, 142 + dy, 1, 5, 15); disc(215 + dx, 141 + dy, 3, 12); R(214 + dx, 140 + dy, 1, 1, 15); }); } });
+    return l;
+  },
+  get obst() { return this.trees.map(([x, y]) => ({ r: [x - 6, y - 4, x + 6, y + 1] })); },
+  objs: [
+    { names: ['owl', 'bird'], x: 132, y: 76, r: 60,
+      look: () => say('A wise old owl with huge amber eyes.'),
+      talk: () => say('"Hoot! Seeking the dragon\'s treasure, are you? Hoot! Dragons fear only one thing: WATER. Bring a bucketful of it, and the beast will flee!"', 'good'),
+      give: () => say('"Hoot? I don\'t eat that."') },
+    { names: ['tree', 'trees', 'branch'], x: 132, y: 76, r: 60,
+      look: () => say('Ancient oaks. Their branches block out most of the sky.'),
+      climb: () => say('You scramble up a few feet, but the owl glares at you so fiercely you climb back down.') },
+    { names: ['mushrooms', 'mushroom', 'toadstool', 'toadstools', 'ring'], x: 215, y: 142, r: 45,
+      look: () => say('A ring of bright red mushrooms with white spots. Pretty. Probably not the edible kind.'),
+      take: () => say('You decide to leave them alone. Something tells you they\'re not for collecting.'),
+      eat() { die('You nibble a mushroom. The world swirls into rainbow colours... and you keel over. Poisonous!'); } },
+  ],
+};
+
+ROOMS.cottage = {
+  horizon: 78, exits: { n: 'meadow' },
+  desc: () => 'A tiny thatched cottage sits here, smoke curling from its chimney. An old woman rocks on a stool in the garden. A path leads north.',
+  bg() {
+    sky(78); grass(78, 17);
+    R(150, 20, 10, 24, 8); R(148, 18, 14, 4, 7);
+    R(70, 38, 130, 42, '#e8d4a0'); R(70, 38, 130, 3, '#cdb880');
+    for (let y = 44; y < 80; y += 6) R(70, y, 130, 1, '#cdb880');
+    for (let i = 0; i < 26; i++) cone(60 + i * 6 + 8, 8, 20, 32, '#a50');
+    cone(135, 4, 160, 36, '#a50');
+    for (let y = 8; y < 40; y += 4) R(120 - (y - 8) * 2 + 30, y, 1, 0, 6);
+    R(120, 52, 22, 28, 6); R(122, 54, 8, 24, '#830'); R(138, 66, 2, 2, 14);
+    R(84, 50, 20, 16, '#4cf'); R(94, 50, 1, 16, 6); R(84, 58, 20, 1, 6); R(82, 66, 24, 3, 6);
+    R(158, 50, 20, 16, '#4cf'); R(168, 50, 1, 16, 6); R(158, 58, 20, 1, 6); R(156, 66, 24, 3, 6);
+    const r = rnd(13);
+    for (let i = 0; i < 20; i++) tuft(60 + r() * 150 | 0, 84 + r() * 6 | 0, [12, 14, 13][i % 3]);
+    for (let x = 0; x < 80; x += 8) { R(x, 150, 2, 14, '#a86'); R(x, 154, 8, 2, '#a86'); }
+    for (let x = 240; x < W; x += 8) { R(x, 150, 2, 14, '#a86'); R(x, 154, 8, 2, '#a86'); }
+  },
+  sprites: () => [{ y: 134, f: () => drawWoman(208, 134) }, { y: 94, f: () => tree(290, 110) }],
+  after() { for (let i = 0; i < 6; i++) disc(154 + Math.sin(T + i) * 3 + i * 2, 16 - i * 4 - (T * 6 % 4), 2 + i / 2 | 0, 'rgba(220,220,220,.6)'); },
+  obst: [{ r: [66, 70, 204, 80] }, { r: [200, 128, 216, 135] }, { r: [284, 106, 296, 111] }],
+  objs: [
+    { names: ['woman', 'lady', 'granny', 'old woman', 'crone'], x: 208, y: 134, r: 55,
+      look: () => say('A kindly old woman with silver hair, rocking gently. Her window box is empty and sad.'),
+      talk() {
+        if (flags.lanternGiven) return say('"Mind the dark, dearie. And thank you for the flowers."');
+        if (inv.has('flowers')) return say('"Oh, what lovely flowers! Won\'t you give them to me?"');
+        say('"Hello dear. I do miss having fresh flowers in my window box. If you bring me some, I\'d gladly give you my old lantern."');
+      },
+      give(it) {
+        if (it === 'flowers' && !flags.lanternGiven) {
+          inv.delete('flowers'); flags.lanternGiven = true; give_item('lantern'); pts(15);
+          return say('"Oh, how lovely! Here, take my old lantern. It\'ll light your way in dark places. Just say LIGHT LANTERN."', 'good');
+        }
+        say('"No thank you, dear."');
+      } },
+    { names: ['cottage', 'house', 'door', 'window'], x: 130, y: 80, r: 100,
+      look: () => say('A cosy thatched cottage with a bright blue front door.'),
+      open: () => say('The door is locked. The old woman smiles and shakes her head.') },
+  ],
+};
+
+/* ---------- movement & world ---------- */
+function near(o) { return Math.hypot(p.x - o.x, (p.y - o.y) * 1.5) <= (o.r || 45); }
+function obstacles() { const r = ROOMS[room]; return r.obst.filter(o => !o.on || o.on()); }
+function blocked(x, y) {
+  for (const o of obstacles()) {
+    const [x1, y1, x2, y2] = o.r;
+    if (x >= x1 && x <= x2 && y >= y1 && y <= y2) {
+      if (o.bump && T - bumpT > 3) { bumpT = T; say(o.bump, 'sys'); }
+      return true;
+    }
+  }
+  return false;
+}
+function takeSnapshot() { snap = { room, x: p.x, y: p.y, inv: [...inv], flags: { ...flags }, score }; }
+function enterRoom(id, from) {
+  const r = ROOMS[id];
+  room = id; target = null;
+  if (from === 'e') p.x = 4;
+  else if (from === 'w') p.x = W - 5;
+  else if (from === 'n') p.y = H - 3;
+  else if (from === 's') p.y = r.horizon + 2;
+  p.y = Math.min(H - 3, Math.max(r.horizon + 1, p.y));
+  for (let d = 0; d < 80 && blocked(p.x, p.y); d += 2) {
+    if (!blocked(p.x, p.y + d) && p.y + d < H - 2) { p.y += d; break; }
+    if (!blocked(p.x, p.y - d) && p.y - d > r.horizon) { p.y -= d; break; }
+  }
+  bumpT = T;
+  takeSnapshot();
+  say(r.desc());
+}
+function leave(d) {
+  const to = ROOMS[room].exits[d];
+  if (to) enterRoom(to, d);
+}
+function die(msg) {
+  if (mode !== 'play') return;
+  mode = 'dead'; target = null;
+  say(msg, 'bad'); say('*** You have died. Press ENTER to try again. ***', 'bad');
+}
+function revive() {
+  room = snap.room; p.x = snap.x; p.y = snap.y; inv = new Set(snap.inv); flags = { ...snap.flags };
+  score = snap.score; pts(0); mode = 'play';
+  say('You wake up where you last felt safe...', 'sys'); say(ROOMS[room].desc());
+}
+function win() {
+  mode = 'win';
+  say('You place the Crown of Eldoria upon King Edward\'s head. The kingdom erupts in cheers!', 'good');
+  say(`*** THE END *** Final score: ${score} of 100. Type RESTART to play again.`, 'good');
+}
+function newGame() {
+  inv = new Set(); flags = {}; score = 0; pts(0); mode = 'play';
+  p = { x: 60, y: 130, dir: 'r', moving: false, t: 0 };
+  logEl.innerHTML = '';
+  say('Welcome, Sir Rowan, to the Kingdom of Eldoria! Walk with the ARROW KEYS (or click the screen) and type commands below. Try HELP.', 'sys');
+  enterRoom('castle', null);
+}
+
+function update(dt) {
+  T += dt;
+  if (mode !== 'play') return;
+  p.t += dt;
+  let dx = 0, dy = 0;
+  if (keys.ArrowLeft) dx--; if (keys.ArrowRight) dx++; if (keys.ArrowUp) dy--; if (keys.ArrowDown) dy++;
+  if (dx || dy) target = null;
+  else if (target) {
+    const ex = target.x - p.x, ey = target.y - p.y;
+    if (Math.abs(ex) < 1.5 && Math.abs(ey) < 1.5) target = null;
+    else { dx = Math.abs(ex) < 1.5 ? 0 : Math.sign(ex); dy = Math.abs(ey) < 1.5 ? 0 : Math.sign(ey); }
+  }
+  p.moving = !!(dx || dy);
+  if (p.moving) {
+    const k = dx && dy ? .75 : 1;
+    const nx = p.x + dx * 58 * dt * k, ny = p.y + dy * 58 * .6 * dt * k;
+    let moved = false;
+    if (dx && !blocked(nx, p.y)) { p.x = nx; moved = true; }
+    if (dy && !blocked(p.x, ny)) { p.y = ny; moved = true; }
+    if (dx) p.dir = dx < 0 ? 'l' : 'r'; else if (dy) p.dir = dy < 0 ? 'u' : 'd';
+    if (target) { p.stuck = moved ? 0 : (p.stuck || 0) + dt; if (p.stuck > .4) target = null; }
+    if (!moved) p.moving = false;
+  }
+  const r = ROOMS[room];
+  if (p.x < 1) { if (r.exits.w) return leave('w'); p.x = 1; }
+  if (p.x > W - 2) { if (r.exits.e) return leave('e'); p.x = W - 2; }
+  if (p.y < r.horizon) { if (r.exits.n) return leave('n'); p.y = r.horizon; }
+  if (p.y > H - 2) { if (r.exits.s) return leave('s'); p.y = H - 2; }
+  if (room === 'cave') {
+    if (!flags.lit && p.x > 110) die('You stumble blindly forward in the dark... and step right off the edge into a bottomless pit!');
+    else if (flags.lit && !flags.dragonGone && p.x > 175) die('You wander too close. The dragon takes a deep breath and roasts you like a marshmallow!');
+  }
+}
+
+/* ---------- render ---------- */
+const BG = {};
+function bgFor(id) {
+  if (!BG[id]) {
+    const c = document.createElement('canvas'); c.width = W; c.height = H;
+    const prev = ctx; ctx = c.getContext('2d'); ROOMS[id].bg(); ctx = prev; BG[id] = c;
+  }
+  return BG[id];
+}
+function render() {
+  ctx = main;
+  if (mode === 'title') {
+    R(0, 0, W, H, 1);
+    for (let i = 0; i < 40; i++) R((i * 97 + T * 6) % W, (i * 53) % 120, 1, 1, 15);
+    cone(160, 28, 60, 40, 4); R(130, 68, 60, 40, 7); R(150, 84, 20, 24, 0);
+    for (let i = 0; i < 4; i++) R(130 + i * 17, 62, 9, 6, 7);
+    drawCrownSprite(160, 128);
+    txt('QUEST FOR THE CROWN', 160, 140, 14, 14);
+    txt('A Tale of Eldoria', 160, 154, 11, 8);
+    if (Math.floor(T * 2) % 2) txt('Press ENTER or click to begin', 160, 172, 15, 8);
+    return;
+  }
+  ctx.drawImage(bgFor(room), 0, 0);
+  const r = ROOMS[room];
+  const list = r.sprites();
+  list.push({ y: p.y, f: drawPlayer });
+  list.sort((a, b) => a.y - b.y).forEach(s => s.f());
+  if (r.after) r.after();
+  if (mode === 'dead') {
+    ctx.globalAlpha = .45; R(0, 0, W, H, 4); ctx.globalAlpha = 1;
+    txt('YOU HAVE DIED', 160, 90, 15, 16);
+    if (Math.floor(T * 2) % 2) txt('Press ENTER to try again', 160, 110, 14, 8);
+  } else if (mode === 'win') {
+    ctx.globalAlpha = .5; R(0, 0, W, H, 0); ctx.globalAlpha = 1;
+    for (let i = 0; i < 30; i++) {
+      const ph = (T * .7 + i * .37) % 1, cx = (i * 71) % W, cy = 30 + (i * 37) % 90, rr = ph * 22;
+      for (let a = 0; a < 10; a++) R(cx + Math.cos(a * .63) * rr, cy + Math.sin(a * .63) * rr, 2, 2, [14, 12, 10, 13, 11][i % 5]);
+    }
+    txt('THE END', 160, 80, 14, 20);
+    txt(`Score ${score} of 100`, 160, 100, 15, 10);
+  }
+}
+
+/* ---------- parser ---------- */
+const STOP = new Set(['the', 'a', 'an', 'at', 'my', 'to', 'on', 'with', 'in', 'into', 'from', 'of', 'some', 'up', 'it', 'for', 'around', 'please', 'out']);
+const VERBS = {
+  look: 'look', l: 'look', examine: 'look', x: 'look', inspect: 'look', read: 'look', search: 'look', check: 'look', see: 'look',
+  take: 'take', get: 'take', grab: 'take', pick: 'take', pickup: 'take', steal: 'take', collect: 'take', fetch: 'take', reach: 'take',
+  give: 'give', offer: 'give', hand: 'give', pay: 'give', bribe: 'give',
+  talk: 'talk', speak: 'talk', ask: 'talk', greet: 'talk', hello: 'talk', hi: 'talk', chat: 'talk',
+  use: 'use', apply: 'use',
+  eat: 'eat', taste: 'eat', drink: 'eat',
+  climb: 'climb', open: 'open', unlock: 'open',
+  fill: 'fill', dip: 'fill', scoop: 'fill',
+  light: 'light', ignite: 'light', douse: 'douse', extinguish: 'douse', snuff: 'douse',
+  throw: 'throw', pour: 'throw', splash: 'throw', toss: 'throw', empty: 'throw', dump: 'throw',
+  inventory: 'inv', inv: 'inv', i: 'inv',
+  help: 'help', hint: 'help', restart: 'restart',
+  go: 'go', walk: 'go', run: 'go', north: 'go', south: 'go', east: 'go', west: 'go', n: 'go', s: 'go', e: 'go', w: 'go',
+};
+function entities() {
+  const out = [];
+  for (const id of inv) out.push({ id, item: ITEMS[id], names: ITEMS[id].names });
+  ROOMS[room].objs.forEach(o => { if (!o.vis || o.vis()) out.push({ obj: o, names: o.names }); });
+  return out;
+}
+function findEnts(rest) {
+  const found = [];
+  for (const e of entities()) {
+    let best = -1;
+    for (const n of e.names) { const m = new RegExp(`\\b${n}\\b`).exec(rest); if (m && (best < 0 || m.index < best)) best = m.index; }
+    if (best >= 0) found.push({ ...e, idx: best });
+  }
+  return found.sort((a, b) => a.idx - b.idx);
+}
+function closeEnough(o) { if (near(o)) return true; say('You\'re not close enough.'); return false; }
+function waterNear() {
+  if (room === 'river') return true;
+  const w = ROOMS.meadow.objs.find(o => o.names[0] === 'well');
+  return room === 'meadow' && near(w);
+}
+function nearestNpc(key) {
+  return ROOMS[room].objs.filter(o => o[key] && (!o.vis || o.vis()) && near(o)).sort((a, b) => Math.hypot(p.x - a.x, p.y - a.y) - Math.hypot(p.x - b.x, p.y - b.y))[0];
+}
+function throwWater() {
+  if (!flags.water) return say('You have no water to throw.');
+  flags.water = false;
+  if (room === 'cave' && flags.lit && !flags.dragonGone) {
+    flags.dragonGone = true; pts(20);
+    say('SPLASH! You hurl the water over the dragon. It shrieks, steam billowing from its scales, and flees through a crack in the cave wall! The hoard is yours to take.', 'good');
+  } else say('You pour the water out on the ground. The ground gets a little muddy.');
+}
+function act(verb, rest, raw) {
+  const ents = findEnts(rest);
+  const items = ents.filter(e => e.item), objs = ents.filter(e => e.obj);
+  switch (verb) {
+    case 'look': {
+      if (!rest) return say(ROOMS[room].desc());
+      const e = ents[0];
+      if (!e) return say('You don\'t see anything like that here.');
+      return e.item ? say(e.item.desc()) : e.obj.look ? e.obj.look() : say('Nothing special.');
+    }
+    case 'take': {
+      const e = ents[0];
+      if (!e) return say(rest ? 'You don\'t see that here.' : 'Take what?');
+      if (e.item) return say('You already have that.');
+      if (!e.obj.take) return say('You can\'t take that.');
+      if (!closeEnough(e.obj)) return;
+      return e.obj.take();
+    }
+    case 'give': {
+      let item = items[0];
+      if (!item && /^pay/.test(raw) && inv.has('coin')) item = { id: 'coin' };
+      if (!item) return say(rest ? 'You don\'t have that.' : 'Give what?');
+      let tgt = objs.find(o => o.obj.give);
+      tgt = tgt ? tgt.obj : nearestNpc('give');
+      if (!tgt) return say('There\'s no one here to give that to.');
+      if (!closeEnough(tgt)) return;
+      return tgt.give(item.id);
+    }
+    case 'talk': {
+      const tgt = objs.find(o => o.obj.talk);
+      const t = tgt ? tgt.obj : nearestNpc('talk');
+      if (!t) return say('There\'s no one here to talk to.');
+      if (!closeEnough(t)) return;
+      return t.talk();
+    }
+    case 'eat': {
+      const e = ents[0];
+      if (!e) return say('Eat what?');
+      if (e.obj && e.obj.eat) { if (!closeEnough(e.obj)) return; return e.obj.eat(); }
+      if (e.item && e.id === 'bucket' && flags.water) { flags.water = false; return say('You gulp down the cool water. Refreshing, but now the bucket is empty.'); }
+      return say('That doesn\'t look tasty.');
+    }
+    case 'climb': {
+      const e = objs.find(o => o.obj.climb);
+      if (!e) return say('There\'s nothing to climb here.');
+      if (!closeEnough(e.obj)) return;
+      return e.obj.climb();
+    }
+    case 'open': {
+      const e = objs.find(o => o.obj.open);
+      if (!e) return say('There\'s nothing to open.');
+      if (!closeEnough(e.obj)) return;
+      return e.obj.open();
+    }
+    case 'fill': {
+      if (!inv.has('bucket')) return say('You have nothing to fill.');
+      if (flags.water) return say('The bucket is already full.');
+      if (!waterNear()) return say('There\'s no water nearby.');
+      flags.water = true; return say('You dip the bucket and haul it up, brimming with cold water.', 'good');
+    }
+    case 'light': {
+      if (!inv.has('lantern')) return say('You have nothing to light.');
+      if (flags.lit) return say('The lantern is already burning.');
+      flags.lit = true; return say('You light the lantern. A warm glow pushes back the dark.', 'good');
+    }
+    case 'douse': {
+      if (!inv.has('lantern') || !flags.lit) return say('There\'s nothing to put out.');
+      flags.lit = false; return say('You snuff out the lantern.');
+    }
+    case 'throw': {
+      if (/\b(water|bucket|pail)\b/.test(rest) || !rest) return inv.has('bucket') ? throwWater() : say('You have nothing to throw.');
+      if (items[0]) return say('You toss it a little way, then pick it up again.');
+      return say('You don\'t have that.');
+    }
+    case 'use': {
+      const it = items[0];
+      if (!it) return say(rest ? 'You don\'t have that.' : 'Use what?');
+      if (it.id === 'lantern') return act(flags.lit ? 'douse' : 'light', '', raw);
+      if (it.id === 'bucket') {
+        if (flags.water && room === 'cave') return throwWater();
+        return act('fill', 'bucket', raw);
+      }
+      if (it.id === 'coin' || it.id === 'flowers') return act('give', rest, raw);
+      if (it.id === 'crown') return act('give', rest + ' king', raw);
+      return say('You\'re not sure how to use that here.');
+    }
+    case 'inv': {
+      if (!inv.size) return say('You are carrying nothing.');
+      return say('You are carrying: ' + [...inv].map(i => ITEMS[i].title).join(', ') + '.');
+    }
+    case 'go': return say('Use the ARROW KEYS (or click on the screen) to walk around.');
+    case 'help': return say('Walk with the ARROW KEYS or click the screen. Type commands: LOOK, LOOK AT <thing>, TAKE <thing>, TALK <person>, GIVE <thing> TO <person>, USE <thing>, FILL BUCKET, LIGHT LANTERN, EAT, CLIMB, OPEN, INVENTORY. You must be close to things to act on them. Goal: recover the Crown of Eldoria for the King. Beware of danger!', 'sys');
+    case 'restart': return newGame();
+  }
+  say('I don\'t understand that.');
+}
+function parse(line) {
+  const raw = line.toLowerCase().replace(/[^a-z ]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!raw) return;
+  say('> ' + raw, 'you');
+  const words = raw.split(' ');
+  if (raw === 'pick up' || raw === 'look around') return act(raw.startsWith('look') ? 'look' : 'take', '', raw);
+  const verbWord = words[0];
+  const verb = VERBS[verbWord];
+  if (!verb) return say(`I don't understand "${words[0]}".`);
+  const rest = words.slice(1).filter(w => !STOP.has(w)).join(' ');
+  act(verb, rest, raw);
+}
+
+/* ---------- input ---------- */
+document.getElementById('form').addEventListener('submit', e => {
+  e.preventDefault();
+  const v = inEl.value.trim(); inEl.value = '';
+  if (mode === 'title') return newGame();
+  if (mode === 'dead') return revive();
+  if (/^restart$/i.test(v)) return newGame();
+  if (mode === 'play') parse(v);
+  else if (mode === 'win' && v) say('The adventure is over. Type RESTART to play again.', 'sys');
+});
+addEventListener('keydown', e => {
+  if (e.key.startsWith('Arrow')) { keys[e.key] = true; e.preventDefault(); }
+});
+addEventListener('keyup', e => { if (e.key.startsWith('Arrow')) keys[e.key] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+cv.addEventListener('click', e => {
+  inEl.focus({ preventScroll: true });
+  if (mode === 'title') return newGame();
+  if (mode === 'dead') return revive();
+  if (mode !== 'play') return;
+  const b = cv.getBoundingClientRect();
+  let x = (e.clientX - b.left) / b.width * W, y = (e.clientY - b.top) / b.height * H;
+  const r = ROOMS[room];
+  if (x < 6 && r.exits.w) x = -6; if (x > W - 6 && r.exits.e) x = W + 6;
+  if (y > H - 6 && r.exits.s) y = H + 6;
+  target = { x, y: Math.max(y, r.horizon - (r.exits.n ? 6 : 0)) };
+});
+
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(.05, (now - last) / 1000); last = now;
+  update(dt); render();
+  requestAnimationFrame(loop);
+}
+window.__game = { get state() { return { room, p, inv: [...inv], flags, score, mode }; }, enterRoom, parse, setPos(x, y) { p.x = x; p.y = y; }, newGame };
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
